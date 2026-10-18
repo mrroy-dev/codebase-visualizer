@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fixed Python `from package.module import names` resolution so absolute imports find local modules across src-layout and flat packages
+
 ## 0.0.8
 
 - Added Dead Code Detection — marks files with zero incoming dependencies (excluding entry points) and orphan files with no connections

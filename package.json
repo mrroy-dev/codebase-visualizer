@@ -88,6 +88,7 @@
   },
   "scripts": {
     "lint": "node -e \"console.log('No lint step configured yet.')\"",
+    "test": "node test/python-imports.test.js",
     "package": "npx @vscode/vsce package --no-dependencies",
     "publish": "npx @vscode/vsce publish --no-dependencies"
   },

@@ -294,9 +294,13 @@ function getAllFiles(dirPath, excludePatterns, includeExtensions, maxFiles, allF
   return allFiles;
 }
 
-function packageNameFromImport(importPath) {
+function packageNameFromImport(importPath, lang) {
   if (!importPath || importPath.startsWith('.') || importPath.startsWith('/')) {
     return null;
+  }
+
+  if (lang === 'py') {
+    return importPath.replace(/^\.+/, '').split('.')[0] || null;
   }
 
   if (importPath.startsWith('@')) {
@@ -305,6 +309,121 @@ function packageNameFromImport(importPath) {
   }
 
   return importPath.split('/')[0];
+}
+
+function addExistingDirectory(dirPath, roots, seen) {
+  if (!dirPath) return;
+  const resolved = path.resolve(dirPath);
+  if (seen.has(resolved)) return;
+
+  try {
+    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
+      seen.add(resolved);
+      roots.push(resolved);
+    }
+  } catch (e) {
+    // Ignore unreadable candidate roots.
+  }
+}
+
+function collectPythonSourceRoots(rootPath) {
+  const roots = [];
+  const seen = new Set();
+  const add = dirPath => addExistingDirectory(dirPath, roots, seen);
+
+  add(rootPath);
+  add(path.join(rootPath, 'src'));
+  add(path.join(rootPath, 'lib'));
+  add(path.join(rootPath, 'python'));
+
+  const pyprojectPath = path.join(rootPath, 'pyproject.toml');
+  try {
+    if (fs.existsSync(pyprojectPath)) {
+      const text = fs.readFileSync(pyprojectPath, 'utf8');
+
+      for (const match of text.matchAll(/\bwhere\s*=\s*\[([^\]]*)\]/g)) {
+        for (const item of match[1].matchAll(/["']([^"']+)["']/g)) {
+          add(path.join(rootPath, item[1]));
+        }
+      }
+
+      for (const match of text.matchAll(/\bfrom\s*=\s*["']([^"']+)["']/g)) {
+        add(path.join(rootPath, match[1]));
+      }
+
+      for (const match of text.matchAll(/package-dir[^\n{]*\{[^}]*["']{2}\s*=\s*["']([^"']+)["']/g)) {
+        add(path.join(rootPath, match[1]));
+      }
+    }
+  } catch (e) {
+    // Fall back to the default roots above.
+  }
+
+  const settings = readJsoncFile(path.join(rootPath, '.vscode', 'settings.json'));
+  const extraPaths = settings?.['python.analysis.extraPaths']
+    || settings?.['python.autoComplete.extraPaths']
+    || [];
+  if (Array.isArray(extraPaths)) {
+    for (const extra of extraPaths) {
+      add(path.resolve(rootPath, String(extra)));
+    }
+  }
+
+  return roots;
+}
+
+function pythonFileToModuleName(relPath) {
+  const normalized = String(relPath || '').replace(/\\/g, '/').replace(/\.py$/i, '');
+  if (!normalized || normalized === '__init__') return null;
+
+  const parts = normalized.split('/').filter(Boolean);
+  if (parts[parts.length - 1] === '__init__') parts.pop();
+  if (!parts.length) return null;
+  if (parts.some(part => part === '__pycache__' || part.startsWith('.'))) return null;
+
+  return parts.join('.');
+}
+
+function scorePythonModuleFile(filePath, rootPath) {
+  const rel = path.relative(rootPath, filePath).replace(/\\/g, '/');
+  let score = rel.length;
+  if (/(^|\/)tests?\//.test(rel)) score += 10000;
+  if (rel.includes('/src/') || rel.startsWith('src/')) score -= 1000;
+  if (filePath.endsWith(`${path.sep}__init__.py`) || filePath.endsWith('/__init__.py')) score -= 10;
+  return score;
+}
+
+function buildPythonModuleIndex(allFiles, rootPath, sourceRoots) {
+  const index = new Map();
+
+  const register = (moduleName, filePath) => {
+    if (!moduleName) return;
+    const existing = index.get(moduleName);
+    if (!existing || scorePythonModuleFile(filePath, rootPath) < scorePythonModuleFile(existing, rootPath)) {
+      index.set(moduleName, filePath);
+    }
+  };
+
+  for (const filePath of allFiles) {
+    if (!filePath.toLowerCase().endsWith('.py')) continue;
+
+    for (const sourceRoot of sourceRoots) {
+      const rel = path.relative(sourceRoot, filePath);
+      if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+      register(pythonFileToModuleName(rel), filePath);
+    }
+  }
+
+  return index;
+}
+
+function isLocalPythonName(importPath, pythonModuleIndex) {
+  if (!importPath || !pythonModuleIndex) return false;
+  const parts = importPath.replace(/^\.+/, '').split('.').filter(Boolean);
+  for (let i = parts.length - 1; i > 0; i--) {
+    if (pythonModuleIndex.has(parts.slice(0, i).join('.'))) return true;
+  }
+  return false;
 }
 
 function extractPythonImports(content) {
@@ -386,7 +505,7 @@ function resolveCandidate(candidatePath, allFilePathSet) {
   return null;
 }
 
-function resolvePythonImport(importPath, fromFile, allFilePathSet, rootPath) {
+function resolvePythonImport(importPath, fromFile, allFilePathSet, rootPath, pythonModuleIndex) {
   const candidatePaths = [];
   const match = importPath.match(/^(\.+)?(.*)$/);
   const leadingDots = match?.[1] || '';
@@ -405,6 +524,19 @@ function resolvePythonImport(importPath, fromFile, allFilePathSet, rootPath) {
       candidatePaths.push(baseDir);
     }
   } else if (remainder) {
+    if (pythonModuleIndex && pythonModuleIndex.has(remainder)) {
+      return pythonModuleIndex.get(remainder);
+    }
+
+    // `from package.module import name` also records package.module.name.
+    // If that last segment is a function/class, resolve the parent module.
+    if (pythonModuleIndex && remainder.includes('.')) {
+      const parentModule = remainder.slice(0, remainder.lastIndexOf('.'));
+      if (pythonModuleIndex.has(parentModule)) {
+        return pythonModuleIndex.get(parentModule);
+      }
+    }
+
     candidatePaths.push(path.join(rootPath, ...remainder.split('.').filter(Boolean)));
   }
 
@@ -416,9 +548,15 @@ function resolvePythonImport(importPath, fromFile, allFilePathSet, rootPath) {
   return null;
 }
 
-function resolveImport(importPath, fromFile, allFilePathSet, rootPath, lang, aliasMatchers = []) {
+function resolveImport(importPath, fromFile, allFilePathSet, rootPath, lang, aliasMatchers = [], pythonModuleIndex = null) {
   if (lang === 'py') {
-    const resolvedPython = resolvePythonImport(importPath, fromFile, allFilePathSet, rootPath);
+    const resolvedPython = resolvePythonImport(
+      importPath,
+      fromFile,
+      allFilePathSet,
+      rootPath,
+      pythonModuleIndex
+    );
     if (resolvedPython) {
       return resolvedPython;
     }
@@ -755,6 +893,8 @@ async function analyzeWorkspace(rootPath, options = {}) {
 
   // Build TS/JS path alias resolvers for React/Vite/TS projects.
   const aliasMatchers = buildTsPathAliasMatchers(rootPath);
+  const pythonSourceRoots = collectPythonSourceRoots(rootPath);
+  const pythonModuleIndex = buildPythonModuleIndex(allFiles, rootPath, pythonSourceRoots);
 
   onProgress(`Found ${allFiles.length} files. Analyzing dependencies...`);
 
@@ -807,16 +947,26 @@ async function analyzeWorkspace(rootPath, options = {}) {
       const resolvedNode = nodes[nodes.length - 1];
 
       for (const imp of imports) {
-        const resolved = resolveImport(imp, filePath, allFilePathSet, rootPath, lang, aliasMatchers);
+        const resolved = resolveImport(
+          imp,
+          filePath,
+          allFilePathSet,
+          rootPath,
+          lang,
+          aliasMatchers,
+          pythonModuleIndex
+        );
         if (resolved) {
           const edgeKey = `${filePath}→${resolved}`;
           if (!edgeSet.has(edgeKey)) {
             edgeSet.add(edgeKey);
             edges.push({ source: filePath, target: resolved, type: 'import' });
           }
-          resolvedNode.imports.push(resolved);
-        } else {
-          const pkgName = packageNameFromImport(imp);
+          if (!resolvedNode.imports.includes(resolved)) {
+            resolvedNode.imports.push(resolved);
+          }
+        } else if (!(lang === 'py' && isLocalPythonName(imp, pythonModuleIndex))) {
+          const pkgName = packageNameFromImport(imp, lang);
           if (pkgName) {
             externalDeps.set(pkgName, (externalDeps.get(pkgName) || 0) + 1);
           }
